@@ -1,0 +1,266 @@
+rules_version = '2';
+
+// ===============================================================
+// Assumed Data Model — AegisBrief (#BuildHybridAI 2026)
+// ===============================================================
+//
+// This security rules file enforces strict owner-scoped access and
+// schema validation for AegisBrief's offline-first hybrid AI workspace.
+//
+// Collection: users
+// Document ID: {userId} (matches request.auth.uid)
+// Access: Owner-only read, create, update; delete explicitly denied
+//         (prevents accidental orphaning of subcollections).
+// Fields (all required; no extraneous keys permitted):
+//   - defaultMode: string (required, enum: 'prefer_on_device' | 'only_on_device' | 'prefer_in_cloud')
+//       User's preferred hybrid inference routing mode.
+//   - piiShieldEnabled: bool (required)
+//       Whether client-side PII redaction is enabled before inference/sync.
+//   - updatedAt: timestamp (required)
+//       Timestamp of the latest preferences update.
+//
+// Collection: users/{userId}/briefs
+// Document ID: {briefId} (1..128 chars)
+// Access: Owner-only read, create, update, delete.
+//         Supports owner-scoped list/where/orderBy/limit queries.
+// Fields (all required; no extraneous keys permitted):
+//   - title: string (required, 1..140 chars)
+//   - category: string (required, enum: 'medical' | 'legal' | 'disaster' | 'journalism' | 'general')
+//   - redactedInput: string (required, 1..12000 chars)
+//   - summary: string (required, 1..12000 chars)
+//   - urgency: string (required, enum: 'low' | 'medium' | 'high' | 'critical')
+//   - actionItems: list<string> (required, 0..20 items, combined length <= 6000 chars)
+//   - inferenceSource: string (required, enum: 'on_device' | 'in_cloud' | 'hybrid_fallback')
+//   - latencyMs: number (required, 0..600000)
+//   - piiRedactedCount: int (required, 0..500)
+//   - createdAt: timestamp (required, immutable after create)
+//   - updatedAt: timestamp (required)
+//
+// Collection: users/{userId}/telemetry
+// Document ID: {eventId} (1..128 chars)
+// Access: Append-only — owner-only read and create; update and delete denied.
+//         Supports owner-scoped list/orderBy/limit queries.
+// Fields (all required; no extraneous keys permitted):
+//   - mode: string (required, enum: 'prefer_on_device' | 'only_on_device' | 'prefer_in_cloud')
+//   - resolvedPath: string (required, enum: 'on_device' | 'in_cloud')
+//   - latencyMs: number (required, 0..600000)
+//   - piiMasked: int (required, 0..500)
+//   - offline: bool (required)
+//   - modelName: string (required, 1..80 chars)
+//   - createdAt: timestamp (required)
+//
+// All other paths (`/{document=**}`): Denied by default.
+//
+// Architectural Notes:
+//   - Timestamps validate native Firestore `timestamp` type (rather than
+//     `== request.time`) to remain compatible with offline-first queued writes.
+//   - Subcollections enforce path-based ownership (`request.auth.uid == userId`)
+//     without requiring `exists(/users/$(userId))` so first-run / offline writes
+//     succeed before preferences initialization and avoid extra read charges.
+//
+// ===============================================================
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ===============================================================
+    // Helper Functions
+    // ===============================================================
+
+    // Check if the caller is authenticated with Firebase Auth
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    // Check if the authenticated caller owns the path scoped by userId
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    // Verify uid (if present in payload) matches the authenticated caller on create
+    function uidUnchanged() {
+      return !('uid' in request.resource.data) ||
+        request.resource.data.uid == request.auth.uid;
+    }
+
+    // Ensure uid (if present in payload) cannot be modified on update
+    function uidNotModified() {
+      return !('uid' in request.resource.data) ||
+        request.resource.data.uid == resource.data.uid;
+    }
+
+    // Validate that all required keys are present in the post-write document
+    function hasRequiredFields(fields) {
+      return request.resource.data.keys().hasAll(fields);
+    }
+
+    // Validate that no extraneous/undeclared keys exist in the post-write document
+    function hasOnlyAllowedFields(fields) {
+      return request.resource.data.keys().hasOnly(fields);
+    }
+
+    // Ensure specified immutable fields were neither modified nor removed on update
+    function areImmutableFieldsUnchanged(fields) {
+      return !request.resource.data.diff(resource.data).affectedKeys().hasAny(fields);
+    }
+
+    // Validate document ID length bounds
+    function isValidDocId(docId) {
+      return docId is string && docId.size() >= 1 && docId.size() <= 128;
+    }
+
+    // Validate string type and inclusive length bounds (prevents 1MB DoS payloads)
+    function isValidString(val, minLen, maxLen) {
+      return val is string &&
+        val.size() >= minLen &&
+        val.size() <= maxLen;
+    }
+
+    // Validate numeric (int or float) inclusive bounds (also rejects NaN and +/-Infinity)
+    function isValidNumberRange(val, minVal, maxVal) {
+      return val is number &&
+        val >= minVal &&
+        val <= maxVal;
+    }
+
+    // Validate integer inclusive bounds
+    function isValidIntRange(val, minVal, maxVal) {
+      return val is int &&
+        val >= minVal &&
+        val <= maxVal;
+    }
+
+    // Validate a list of strings with item count cap and combined character size cap.
+    // Note: list.join('') fails closed (denies) if any element is not a string.
+    function isValidStringList(listVal, maxItems, maxTotalChars) {
+      return listVal is list &&
+        listVal.size() <= maxItems &&
+        (listVal.size() == 0 ||
+          (listVal.join('') is string && listVal.join('').size() <= maxTotalChars));
+    }
+
+    // Shared enum validator for hybrid routing modes
+    function isValidHybridMode(mode) {
+      return mode is string &&
+        mode in ['prefer_on_device', 'only_on_device', 'prefer_in_cloud'];
+    }
+
+    // ===============================================================
+    // Domain Validators (Called on BOTH create and update)
+    // ===============================================================
+
+    function isValidUserPreferences(data) {
+      let allowedFields = ['defaultMode', 'piiShieldEnabled', 'updatedAt'];
+      return hasOnlyAllowedFields(allowedFields) &&
+        hasRequiredFields(allowedFields) &&
+        isValidHybridMode(data.defaultMode) &&
+        data.piiShieldEnabled is bool &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidBrief(data) {
+      let allowedFields = [
+        'title',
+        'category',
+        'redactedInput',
+        'summary',
+        'urgency',
+        'actionItems',
+        'inferenceSource',
+        'latencyMs',
+        'piiRedactedCount',
+        'createdAt',
+        'updatedAt'
+      ];
+      return hasOnlyAllowedFields(allowedFields) &&
+        hasRequiredFields(allowedFields) &&
+        isValidString(data.title, 1, 140) &&
+        data.category is string &&
+        data.category in ['medical', 'legal', 'disaster', 'journalism', 'general'] &&
+        isValidString(data.redactedInput, 1, 12000) &&
+        isValidString(data.summary, 1, 12000) &&
+        data.urgency is string &&
+        data.urgency in ['low', 'medium', 'high', 'critical'] &&
+        isValidStringList(data.actionItems, 20, 6000) &&
+        data.inferenceSource is string &&
+        data.inferenceSource in ['on_device', 'in_cloud', 'hybrid_fallback'] &&
+        isValidNumberRange(data.latencyMs, 0, 600000) &&
+        isValidIntRange(data.piiRedactedCount, 0, 500) &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidTelemetryEvent(data) {
+      let allowedFields = [
+        'mode',
+        'resolvedPath',
+        'latencyMs',
+        'piiMasked',
+        'offline',
+        'modelName',
+        'createdAt'
+      ];
+      return hasOnlyAllowedFields(allowedFields) &&
+        hasRequiredFields(allowedFields) &&
+        isValidHybridMode(data.mode) &&
+        data.resolvedPath is string &&
+        data.resolvedPath in ['on_device', 'in_cloud'] &&
+        isValidNumberRange(data.latencyMs, 0, 600000) &&
+        isValidIntRange(data.piiMasked, 0, 500) &&
+        data.offline is bool &&
+        isValidString(data.modelName, 1, 80) &&
+        data.createdAt is timestamp;
+    }
+
+    // ===============================================================
+    // Default Deny — Block all unmatched paths by default
+    // ===============================================================
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // ===============================================================
+    // User Workspace Preferences & Scoped Subcollections
+    // ===============================================================
+
+    match /users/{userId} {
+      // Owner-only workspace preferences; delete explicitly denied
+      allow read: if isOwner(userId);
+      allow create: if isOwner(userId) &&
+                       uidUnchanged() &&
+                       isValidUserPreferences(request.resource.data);
+      allow update: if isOwner(userId) &&
+                       uidNotModified() &&
+                       isValidUserPreferences(request.resource.data);
+      allow delete: if false;
+
+      // Sanitized/redacted field triage briefs (owner-only CRUD + immutable createdAt)
+      match /briefs/{briefId} {
+        allow read: if isOwner(userId);
+        allow create: if isOwner(userId) &&
+                         isValidDocId(briefId) &&
+                         uidUnchanged() &&
+                         isValidBrief(request.resource.data);
+        allow update: if isOwner(userId) &&
+                         isValidDocId(briefId) &&
+                         uidNotModified() &&
+                         isValidBrief(request.resource.data) &&
+                         areImmutableFieldsUnchanged(['createdAt']) &&
+                         request.resource.data.createdAt == resource.data.createdAt;
+        allow delete: if isOwner(userId);
+      }
+
+      // Append-only hybrid inference benchmark/routing telemetry (owner read/create only)
+      match /telemetry/{eventId} {
+        allow read: if isOwner(userId);
+        allow create: if isOwner(userId) &&
+                         isValidDocId(eventId) &&
+                         uidUnchanged() &&
+                         isValidTelemetryEvent(request.resource.data);
+        allow update: if false;
+        allow delete: if false;
+      }
+    }
+  }
+}
